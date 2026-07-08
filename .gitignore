@@ -1,0 +1,4 @@
+.codeevolver.lock
+.codeevolver/
+__pycache__/
+env/
