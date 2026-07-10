@@ -1,6 +1,6 @@
 # Metric: binary accuracy of the Accept/Reject decision, with textual feedback.
 #
-# Contract (CodeEvolver mounted evaluator): called as fn(output=..., example=...)
+# Contract (mounted evaluator): called as fn(output=..., example=...)
 # where `example` is an attribute-access row object (NOT a dict). Returns
 # {"score": float, "feedback": str}. Unparseable/empty predictions score 0.0 —
 # they are NOT dropped from the denominator (stricter than the original
