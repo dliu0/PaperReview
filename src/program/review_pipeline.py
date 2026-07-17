@@ -107,14 +107,65 @@ class ReviewPipeline:
     """One LLM call per paper: full NeurIPS-form review, then extract Decision."""
 
     def __init__(self):
-        self.model = "openai/gpt-5.4-mini"
-        # Pin the solver to the real OpenAI endpoint. The server environment
-        # points OPENAI_* at GMI Cloud (for the reflection LM), so explicit
-        # kwargs are required here; REAL_OPENAI_API_KEY carries the OpenAI key.
-        self.api_base = "https://api.openai.com/v1"
-        self.api_key = os.environ.get("REAL_OPENAI_API_KEY") or os.environ.get(
-            "OPENAI_API_KEY"
-        )
+        # Solver LM: DeepSeek-V4-Flash on GMI Cloud (reasoning=high set on the
+        # call below). Same wiring as the arc-agi experiment: the optimizer
+        # (GLM-5.2) and this solver both run on GMI, so we pass the GMI endpoint
+        # + key explicitly (the proven GMI-as-OpenAI pattern) rather than
+        # relying on OPENAI_* env, which the server points at GMI for the
+        # reflection LM.
+        self.model = "openai/deepseek-ai/DeepSeek-V4-Flash"
+        self.api_base = "https://api.gmi-serving.com/v1"
+        self.api_key = os.environ.get("GMI_CLOUD_API_KEY") or os.environ.get("GMI_API_KEY")
+
+    # --- Hang guard (mirrors the arc-agi seed solver) --------------------
+    # GMI can "hang" a request: zero bytes until its gateway kills the
+    # connection minutes later, which walls an entire parallel eval at the
+    # straggler. Streaming makes hangs detectable — GMI streams reasoning
+    # deltas continuously (measured inter-chunk gap ~3s), so READ_GAP_TIMEOUT_S
+    # of total silence is an unambiguous hang: abort fast and retry instead of
+    # waiting for the gateway. httpx applies `timeout` per READ on a stream, so
+    # long generations are unaffected; TOTAL_BUDGET_S caps the row across all
+    # attempts.
+    READ_GAP_TIMEOUT_S = 240
+    TOTAL_BUDGET_S = 2400
+    MAX_ATTEMPTS = 2
+
+    def _complete(self, messages):
+        """Streaming completion with hang detection; returns content text."""
+        import time as _time
+
+        start = _time.monotonic()
+        last_err = None
+        for _attempt in range(self.MAX_ATTEMPTS):
+            if _time.monotonic() - start > self.TOTAL_BUDGET_S - self.READ_GAP_TIMEOUT_S:
+                break
+            try:
+                stream = litellm.completion(
+                    model=self.model,
+                    api_base=self.api_base,
+                    api_key=self.api_key,
+                    messages=messages,
+                    reasoning_effort="high",
+                    allowed_openai_params=["reasoning_effort"],
+                    stream=True,
+                    # Per-read gap cap on a stream (NOT total duration): only
+                    # trips when the connection goes fully silent (real hang).
+                    timeout=self.READ_GAP_TIMEOUT_S,
+                )
+                parts = []
+                for chunk in stream:
+                    if _time.monotonic() - start > self.TOTAL_BUDGET_S:
+                        raise TimeoutError(
+                            f"row exceeded total budget {self.TOTAL_BUDGET_S}s"
+                        )
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        if delta is not None and getattr(delta, "content", None):
+                            parts.append(delta.content)
+                return "".join(parts)
+            except Exception as exc:  # noqa: BLE001 — hang/gap/transient
+                last_err = exc
+        raise last_err if last_err else RuntimeError("completion failed")
 
     def __call__(self, paper_text: str = "", **kwargs) -> str:
         prompt = (
@@ -126,23 +177,17 @@ Here is the paper you are asked to review:
 ```"""
         )
         try:
-            response = litellm.completion(
-                model=self.model,
-                api_base=self.api_base,
-                api_key=self.api_key,
-                messages=[
+            content = self._complete(
+                [
                     {"role": "system", "content": REVIEWER_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
-                ],
-                timeout=600,
-                num_retries=2,
+                ]
             )
-            content = response.choices[0].message.content or ""
         except Exception as e:
             print(f"[review] LLM call error: {e}")
             return ""
 
-        review = _extract_last_json(content)
+        review = _extract_last_json(content or "")
         if not review or "Decision" not in review:
             print("[review] could not extract Decision from response")
             return ""
