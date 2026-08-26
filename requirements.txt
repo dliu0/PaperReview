@@ -1,0 +1,11 @@
+# Solver-side dependencies for the PaperReview CodeEvolver benchmark.
+#
+# runner/Dockerfile.bench builds the client venv from this file, so it is a
+# HARD requirement for the fleet image: without it the benchmark layer fails
+# to build. Keep it minimal — the seed program is a single litellm call, and
+# every package here is installed into every run's venv.
+litellm==1.91.0
+# litellm's retry path imports tenacity lazily; without it a transient
+# provider error raises `No module named 'tenacity'` and becomes a false 0.0
+# instead of a retry.
+tenacity==9.1.4
