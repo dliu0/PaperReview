@@ -3,3 +3,6 @@
 __pycache__/
 env/
 traces/
+
+# Local provider credentials (see .env). Never commit.
+.env
