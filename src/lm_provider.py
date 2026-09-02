@@ -157,31 +157,38 @@ _ALLOWED_OPENAI_PARAMS = ["reasoning_effort"]
 # Most preferred first, and the single ordering that decides both who serves a
 # call and who covers for whom (C3).
 #
-# This differs from LangProBe's ("gmi", "deepseek", "deepinfra") on purpose, and
-# the reason is reachability rather than taste. CodeEvolver's runner egresses
-# through squid, and `runner/squid.conf` allows only `.gmi-serving.com` and
-# `.deepinfra.com`; `runner/preflight.py` probes only those two hosts, and
-# nothing in the runner forwards `DEEPSEEK_API_KEY` into the container. So on
-# the fleet the first-party DeepSeek API is not a route this benchmark can take
-# -- it stays in the table (it works fine for a local run that exports the key)
-# but it ranks last, because a cover that cannot be reached is not a cover.
-# Restoring the LangProBe order is a one-line edit once the runner allowlists
-# `api.deepseek.com` and passes the key through.
-PROVIDER_PREFERENCE = ("gmi", "deepinfra", "deepseek")
+# Most preferred first, and identical to LangProBe's and phantom-wiki's order so
+# that all five fleet benchmarks route the same way. GMI leads: cheapest per
+# token and the fastest of the three measured on hover. DeepSeek's first-party
+# API covers it; DeepInfra ranks last (uniformly ~1.7x slower than GMI, and
+# ~14x slower on the DeepSeek-V4-Flash streaming path).
+#
+# This repo ranked DeepInfra second until 2026-09-02, for reachability rather
+# than taste: CodeEvolver's runner egresses through squid, and back then
+# `runner/squid.conf` allowed only `.gmi-serving.com` and `.deepinfra.com`,
+# `runner/preflight.py` probed only those two hosts, and nothing forwarded
+# `DEEPSEEK_API_KEY` into the container -- a cover that cannot be reached is not
+# a cover. All three are now wired on the CE side (`.deepseek.com` in
+# `squid.conf`, `api.deepseek.com` in `preflight.py::ALLOWED_HOSTS`,
+# `DEEPSEEK_API_KEY` in every `matrix*.yaml` `env_passthrough`), so the
+# reachability argument is spent and the order matches the other repos.
+PROVIDER_PREFERENCE = ("gmi", "deepseek", "deepinfra")
 PROVIDERS = PROVIDER_PREFERENCE
 
-# The primary when $LM_PROVIDER is unset. LangProBe currently pins this one step
-# down its order because GMI's account there is unfunded; this repo's runs are
-# the ones GMI is funded for, so it stays at the head. If GMI starts failing
+# The primary when $LM_PROVIDER is unset: the head of the preference order, so
+# the default run is GMI primary with DeepSeek covering. If GMI starts failing
 # every call, move this to PROVIDER_PREFERENCE[1] -- the covers follow the same
-# list, so that single edit is the whole change.
+# list, so that single edit is the whole change. Note it is a SOURCE edit inside
+# the seed program, so it only reaches a fleet run once the seed bundle and
+# runner image are rebuilt; $LM_PROVIDER does the same thing for one run with no
+# rebuild.
 DEFAULT_PROVIDER = PROVIDER_PREFERENCE[0]
 
 PROVIDER_ENV_VAR = "LM_PROVIDER"
 FALLBACK_ENV_VAR = "LM_FALLBACK"
 # Who covers for whom when LM_FALLBACK is on but does not name a provider: the
-# next provider down the preference order, wrapping at the end. So GMI diverts
-# to DeepInfra, DeepInfra to DeepSeek, DeepSeek back to GMI.
+# next provider down the preference order, wrapping at the end. So GMI (the
+# primary) diverts to DeepSeek, DeepSeek to DeepInfra, DeepInfra back to GMI.
 DEFAULT_FALLBACK = {
     provider: PROVIDER_PREFERENCE[(i + 1) % len(PROVIDER_PREFERENCE)]
     for i, provider in enumerate(PROVIDER_PREFERENCE)

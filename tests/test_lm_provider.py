@@ -165,8 +165,8 @@ def test_construction_pins_both_routes_to_the_same_model():
     assert lm.task_model == TASK_MODEL
     assert lm.model == GMI_MODEL
     assert lm.api_base == GMI_API_BASE
-    assert lm.fallback_provider == "deepinfra"
-    assert lm.fallback_model == DEEPINFRA_MODEL
+    assert lm.fallback_provider == "deepseek"
+    assert lm.fallback_model == DEEPSEEK_MODEL
     assert MODEL_ROUTES[TASK_MODEL][lm.fallback_provider] is not None
 
 
@@ -189,23 +189,23 @@ def test_a_402_reissues_the_identical_request_on_the_cover(fake, capsys):
     lm = build_task_lm()
     stats = CallStats()
 
-    assert lm.complete(MESSAGES, stats=stats) == "from-deepinfra"
+    assert lm.complete(MESSAGES, stats=stats) == "from-deepseek"
 
-    assert fake.providers_called == [GMI_MODEL, GMI_MODEL, DEEPINFRA_MODEL]
+    assert fake.providers_called == [GMI_MODEL, GMI_MODEL, DEEPSEEK_MODEL]
     primary, cover = fake.calls[0], fake.calls[-1]
     assert cover["messages"] is primary["messages"], "the cover must see the same request"
     assert cover["reasoning_effort"] == primary["reasoning_effort"] == REASONING_EFFORT
     assert cover["stream"] is True and cover["timeout"] == READ_GAP_TIMEOUT_S
-    assert stats.diverted and stats.served_by == "deepinfra"
+    assert stats.diverted and stats.served_by == "deepseek"
     err = capsys.readouterr().err
-    assert "gmi error" in err and "deepinfra" in err
+    assert "gmi error" in err and "deepseek" in err
 
 
 @pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 422, 429, 500, 502, 503])
 def test_every_http_status_is_diverted(fake, status):
     """LiteLLM retries only 408/409/429/5xx; a cover can answer any of them."""
     fake.gmi = _api_error(status)
-    assert build_task_lm().complete(MESSAGES) == "from-deepinfra"
+    assert build_task_lm().complete(MESSAGES) == "from-deepseek"
 
 
 @pytest.mark.parametrize(
@@ -218,7 +218,7 @@ def test_every_http_status_is_diverted(fake, status):
 )
 def test_every_api_error_kind_is_diverted(fake, exc):
     fake.gmi = exc
-    assert build_task_lm().complete(MESSAGES) == "from-deepinfra"
+    assert build_task_lm().complete(MESSAGES) == "from-deepseek"
 
 
 @pytest.mark.parametrize("name", list(lm_provider.NON_FALLBACK_ERROR_NAMES))
@@ -230,7 +230,7 @@ def test_request_is_the_problem_errors_are_not_diverted(fake, name):
     fake.gmi = exc
     with pytest.raises(type(exc)):
         build_task_lm().complete(MESSAGES)
-    assert DEEPINFRA_MODEL not in fake.providers_called
+    assert DEEPSEEK_MODEL not in fake.providers_called
 
 
 @pytest.mark.parametrize("exc", [ValueError("program bug"), KeyError("Decision")])
@@ -239,16 +239,16 @@ def test_non_api_errors_are_not_diverted(fake, exc):
     fake.gmi = exc
     with pytest.raises(type(exc)):
         build_task_lm().complete(MESSAGES)
-    assert DEEPINFRA_MODEL not in fake.providers_called
+    assert DEEPSEEK_MODEL not in fake.providers_called
 
 
 def test_fallback_failure_reraises_chained_from_the_primary_error(fake, capsys):
     primary = _api_error(402)
     fake.gmi = primary
-    fake.deepinfra = _api_error(503, "deepinfra is down too")
+    fake.deepseek = _api_error(503, "deepseek is down too")
     with pytest.raises(litellm.APIError) as caught:
         build_task_lm().complete(MESSAGES)
-    assert "deepinfra is down too" in str(caught.value)
+    assert "deepseek is down too" in str(caught.value)
     assert caught.value.__cause__ is primary, "the primary error must stay attached"
     assert "fallback failed" in capsys.readouterr().err
 
@@ -278,9 +278,9 @@ def test_should_fallback_classifier():
 # ---------------------------------------------------------------------------
 
 
-def test_default_routing_is_gmi_primary_covered_by_deepinfra():
+def test_default_routing_is_gmi_primary_covered_by_deepseek():
     lm = build_task_lm()
-    assert (lm.provider, lm.fallback_provider) == ("gmi", "deepinfra")
+    assert (lm.provider, lm.fallback_provider) == ("gmi", "deepseek")
 
 
 def test_the_default_provider_is_a_member_of_the_preference_order():
@@ -298,11 +298,15 @@ def test_default_fallback_pairs_are_declared_for_every_provider():
     assert all(v != k for k, v in DEFAULT_FALLBACK.items())
 
 
-def test_the_unreachable_provider_ranks_last():
-    """DeepSeek's first-party API is not egress-allowed from the runner, so it
-    is a local-only route and must never be anyone's default cover on the fleet."""
-    assert PROVIDER_PREFERENCE[-1] == "deepseek"
-    assert "deepseek" not in (DEFAULT_FALLBACK["gmi"],)
+def test_the_order_matches_the_other_seed_programs():
+    """One order across all five fleet benchmarks, so an arm's routing is never
+    a confound. DeepSeek ranked last here until 2026-09-02, when it was a
+    local-only route: the runner egressed through squid, which allowed only
+    `.gmi-serving.com` and `.deepinfra.com`, and no `DEEPSEEK_API_KEY` reached
+    the container. All three are wired on the CE side now, so the slowest
+    provider ranks last instead of the unreachable one."""
+    assert PROVIDER_PREFERENCE == ("gmi", "deepseek", "deepinfra")
+    assert DEFAULT_FALLBACK["gmi"] == "deepseek"
 
 
 # ---------------------------------------------------------------------------
@@ -311,9 +315,10 @@ def test_the_unreachable_provider_ranks_last():
 
 
 def test_lm_provider_repoints_the_primary_and_its_cover(monkeypatch, fake):
+    """DeepInfra is last in the order, so its cover wraps around to GMI."""
     monkeypatch.setenv("LM_PROVIDER", "deepinfra")
     lm = build_task_lm()
-    assert (lm.provider, lm.fallback_provider) == ("deepinfra", "deepseek")
+    assert (lm.provider, lm.fallback_provider) == ("deepinfra", "gmi")
     assert lm.complete(MESSAGES) == "from-deepinfra"
     assert fake.providers_called == [DEEPINFRA_MODEL]
 
@@ -324,10 +329,10 @@ def test_deepseek_primary_sends_the_request_to_deepseek(monkeypatch, fake):
     assert fake.providers_called == [DEEPSEEK_MODEL]
 
 
-def test_deepinfra_primary_falls_back_to_deepseek(monkeypatch, fake):
+def test_deepinfra_primary_falls_back_to_gmi(monkeypatch, fake):
     monkeypatch.setenv("LM_PROVIDER", "deepinfra")
     fake.deepinfra = _api_error(500)
-    assert build_task_lm().complete(MESSAGES) == "from-deepseek"
+    assert build_task_lm().complete(MESSAGES) == "from-gmi"
 
 
 @pytest.mark.parametrize("value", ["0", "false", "no", "off", "none"])
@@ -438,7 +443,7 @@ def test_serving_a_different_model_is_a_one_row_edit(monkeypatch, fake):
     )
     monkeypatch.setenv("LM_MODEL", "other-model")
     lm = build_task_lm()
-    assert (lm.model, lm.fallback_model) == ("openai/other", "deepinfra/other")
+    assert (lm.model, lm.fallback_model) == ("openai/other", "deepseek/other")
 
 
 def test_a_provider_missing_from_the_row_fails_at_construction(monkeypatch):
@@ -479,23 +484,23 @@ def test_a_single_provider_run_keeps_the_full_retry_budget(monkeypatch, fake):
 
 def test_the_cover_keeps_the_full_budget_because_there_is_nowhere_after_it(fake):
     fake.gmi = _api_error(402)
-    fake.deepinfra = _api_error(500)
+    fake.deepseek = _api_error(500)
     with pytest.raises(litellm.APIError):
         build_task_lm().complete(MESSAGES)
-    assert fake.providers_called.count(DEEPINFRA_MODEL) == COVER_MAX_ATTEMPTS
+    assert fake.providers_called.count(DEEPSEEK_MODEL) == COVER_MAX_ATTEMPTS
 
 
 def test_stats_survive_a_call_that_never_returns(fake):
     """The failure path must leave the same telemetry as the success path --
     an exhausted call used to record nothing but the exception."""
     fake.gmi = _api_error(402)
-    fake.deepinfra = _api_error(500)
+    fake.deepseek = _api_error(500)
     stats = CallStats()
     with pytest.raises(litellm.APIError):
         build_task_lm().complete(MESSAGES, stats=stats)
     assert stats.attempts == MAX_ATTEMPTS + COVER_MAX_ATTEMPTS
     assert len(stats.errors) == stats.attempts
-    assert stats.diverted and stats.provider == "gmi" and stats.served_by == "deepinfra"
+    assert stats.diverted and stats.provider == "gmi" and stats.served_by == "deepseek"
 
 
 # ---------------------------------------------------------------------------
@@ -581,11 +586,11 @@ def test_an_outage_stops_costing_primary_attempts_once_the_breaker_opens(fake, b
     fake.gmi = _api_error(503)
     lm = build_task_lm()
     for _ in range(10):
-        assert lm.complete(MESSAGES) == "from-deepinfra"
+        assert lm.complete(MESSAGES) == "from-deepseek"
     # Three diverted failures open it; every later call skips gmi entirely.
     assert breaker.state == "open"
     assert fake.providers_called.count(GMI_MODEL) == 3 * MAX_ATTEMPTS
-    assert fake.providers_called.count(DEEPINFRA_MODEL) == 10
+    assert fake.providers_called.count(DEEPSEEK_MODEL) == 10
 
 
 def test_a_stray_error_never_opens_the_breaker(fake, breaker):
@@ -640,7 +645,7 @@ def test_a_skipped_primary_is_recorded_in_the_stats(fake, breaker):
         lm.complete(MESSAGES)
     stats = CallStats()
     lm.complete(MESSAGES, stats=stats)
-    assert stats.primary_skipped and stats.served_by == "deepinfra"
+    assert stats.primary_skipped and stats.served_by == "deepseek"
     assert stats.attempts == 1, "a skipped primary costs no attempt at all"
 
 
