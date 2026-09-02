@@ -2,3 +2,4 @@
 .codeevolver/
 __pycache__/
 env/
+traces/

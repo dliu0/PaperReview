@@ -1,5 +1,12 @@
 # Solver-side dependencies for the PaperReview CodeEvolver benchmark.
 #
+# Python 3.10-3.13. The ceiling is litellm's, not ours: 1.91.0 declares
+# `requires_python = "<3.14,>=3.10"`, so a 3.14 interpreter cannot install it
+# at all (1.93.0 is the first release that allows 3.14). Nothing in this repo
+# pins an interpreter, so a machine whose default `python3` is 3.14 -- a
+# current Homebrew, for one -- will fail at `pip install -r` rather than at
+# runtime. Build local venvs with an explicit `python3.11 -m venv`.
+#
 # runner/Dockerfile.bench builds the client venv from this file, so it is a
 # HARD requirement for the fleet image: without it the benchmark layer fails
 # to build. Keep it minimal — the seed program is a single litellm call, and
@@ -9,3 +16,22 @@ litellm==1.91.0
 # provider error raises `No module named 'tenacity'` and becomes a false 0.0
 # instead of a retry.
 tenacity==9.1.4
+# `openai` is not listed separately: litellm depends on it and pins a compatible
+# range. `src/lm_provider.py` imports it directly for `openai.APIError`, the
+# common base of every LiteLLM exception and the class the cross-provider
+# fallback keys on (docs/provider_fallback.md, C4).
+
+# OpenTelemetry: `src/program/_tracing.py` imports the API to emit the spans
+# CodeEvolver's architect reads. The engine already installs both packages into
+# every client venv, so these are listed for a different reason -- without them
+# `pip install -r requirements.txt` produces a repo whose tracing silently
+# no-ops, and tests/test_tracing.py cannot run at all.
+#
+# Deliberately floors, not the exact pins used above: the engine installs its
+# own versions into the same venv, and an exact pin here would fight that. The
+# API/SDK pair must agree, and 1.44.0 is what this repo has been exercised on.
+opentelemetry-api>=1.44.0
+# SDK is what makes spans real -- with only the API installed, OTel falls back
+# to a no-op provider. Needed by the harness, by tests/test_tracing.py, and by
+# the dev-only `src/program/_tracing_export.py`.
+opentelemetry-sdk>=1.44.0

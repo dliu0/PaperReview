@@ -19,11 +19,10 @@ Needs `opentelemetry-sdk` (the harness installs it into every client venv).
 
 from __future__ import annotations
 
+import ast
 import json
 import sys
 import types
-
-import pytest
 
 REVIEW = {
     "Summary": "a summary",
@@ -47,6 +46,15 @@ def _install_fake_litellm(monkeypatch, *, fail_times: int = 0, response: str = R
     """
     calls = {"n": 0}
 
+    # The provider wiring moved to `src/lm_provider.py`, which reads the GMI
+    # route's key at construction and resolves the primary/cover from the
+    # environment. Pin both so these tests describe the default routing rather
+    # than whatever the developer happens to have exported.
+    monkeypatch.delenv("GMI_CLOUD_API_KEY", raising=False)
+    monkeypatch.setenv("GMI_API_KEY", "test-key")
+    for var in ("LM_MODEL", "LM_PROVIDER", "LM_FALLBACK", "LM_BREAKER"):
+        monkeypatch.delenv(var, raising=False)
+
     class _Delta:
         def __init__(self, c):
             self.content = c
@@ -67,6 +75,7 @@ def _install_fake_litellm(monkeypatch, *, fail_times: int = 0, response: str = R
         assert kw["stream"] is True
         assert kw["timeout"] == 240
         assert kw["api_base"] == "https://api.gmi-serving.com/v1"
+        assert kw["api_key"] == "test-key", "the GMI route must pass its key explicitly"
         if calls["n"] <= fail_times:
             raise RuntimeError(f"simulated hang #{calls['n']}")
         return [_Chunk(response[i : i + 40]) for i in range(0, len(response), 40)]
@@ -88,6 +97,10 @@ def _run_and_collect(monkeypatch, paper_text: str, **stub_kwargs):
 
     _install_fake_litellm(monkeypatch, **stub_kwargs)
 
+    from src.lm_provider import reset_breakers
+
+    reset_breakers()  # provider health is process-global; don't leak across tests
+
     exporter = InMemorySpanExporter()
     provider = TracerProvider()
     provider.add_span_processor(SimpleSpanProcessor(exporter))
@@ -99,7 +112,7 @@ def _run_and_collect(monkeypatch, paper_text: str, **stub_kwargs):
     else:
         trace.set_tracer_provider(provider)
 
-    for mod in [m for m in sys.modules if m.endswith("review_pipeline")]:
+    for mod in [m for m in sys.modules if m.endswith(("review_pipeline", "_tracing"))]:
         del sys.modules[mod]
     from src.program.review_pipeline import ReviewPipeline
 
@@ -134,7 +147,9 @@ def test_per_dimension_ratings_are_recorded(monkeypatch):
 
     extract = _by_name(spans, "extract_review")
     assert extract is not None
-    scores = json.loads(dict(extract.attributes)["ce.output"])
+    # `@traceable` records the return value via `str()`, so this is a Python
+    # repr rather than JSON. Both are equally greppable in the trace.
+    scores = ast.literal_eval(dict(extract.attributes)["ce.output"])
     assert scores["Soundness"] == 3
     assert scores["Significance"] == 2
     assert scores["Overall"] == 6
@@ -170,7 +185,10 @@ def test_malformed_response_is_recorded_as_an_extraction_error(monkeypatch):
     assert out == ""
     attrs = dict(_by_name(spans, "extract_review").attributes)
     assert "could not extract Decision" in attrs["ce.error"]
-    assert "decline" in attrs["ce.output"], "the unusable response must be inspectable"
+    # The unusable text is this span's INPUT; a failed parse has no output.
+    assert "decline" in attrs["ce.inputs.content"], (
+        "the unusable response must be inspectable"
+    )
     # The call itself SUCCEEDED — the failure was in parsing. Keeping those
     # two distinguishable is the point: one is a provider problem, the other
     # is the rubric producing unusable output.
@@ -198,13 +216,18 @@ def test_span_content_stays_bounded_for_a_full_length_paper(monkeypatch):
     assert "elided" in user["content"], "the excerpt must say it was truncated"
 
 
-@pytest.mark.parametrize("has_otel", [False])
-def test_pipeline_works_without_opentelemetry(monkeypatch, has_otel):
-    """Running this file outside the harness venv must not fail."""
+def test_pipeline_works_without_opentelemetry(monkeypatch):
+    """Running this file outside the harness venv must not fail.
+
+    `@traceable` decides at import time whether to wrap at all, so the absence
+    has to be simulated before the modules are imported, not patched after.
+    """
     _install_fake_litellm(monkeypatch)
-    for mod in [m for m in sys.modules if m.endswith("review_pipeline")]:
-        del sys.modules[mod]
+    monkeypatch.setitem(sys.modules, "opentelemetry", None)
+    for mod in [m for m in sys.modules if m.endswith(("review_pipeline", "_tracing"))]:
+        monkeypatch.delitem(sys.modules, mod)
+    import src.program._tracing as tracing
     import src.program.review_pipeline as rp
 
-    monkeypatch.setattr(rp, "_otel_trace", None)
+    assert tracing._OTEL_AVAILABLE is False, "the fallback path was not exercised"
     assert rp.ReviewPipeline()(paper_text="a short paper") == "accept"

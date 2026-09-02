@@ -2,83 +2,30 @@
 # Prompt adapted from the meta-hyperagents paper_review domain (itself adapted
 # from SakanaAI/AI-Scientist perform_review.py).
 
-import contextlib
 import json
-import os
 import re
 import sys
-import time
 
-import litellm
+# Provider wiring lives OUTSIDE this package, in `src/lm_provider.py`: the
+# pinned model, the endpoints, the keys, the streaming hang guard and the
+# cross-provider fallback are benchmark infrastructure, not part of the review
+# procedure being optimized (docs/provider_fallback.md, C8). `$LM_PROVIDER` /
+# `$LM_FALLBACK` repoint the provider, name the cover, or disarm the divert
+# without editing code. Nothing below names a model, an endpoint or a key.
+from src.lm_provider import REASONING_EFFORT, CallStats, build_task_lm
 
-# --- Tracing -----------------------------------------------------------------
-# The harness collects OpenTelemetry spans per row and writes them to
-# `rows/<example_id>/span_NNN.json`, but only if the program emits any. Nothing
-# auto-instruments a raw `litellm.completion` call, so before this the pipeline
-# produced exactly ONE span carrying its final output — the single word
-# "accept"/"reject" this class returns — and the review itself (the THOUGHT, the
-# per-dimension ratings, the Overall score) was computed and thrown away
-# unseen. The architect cannot improve a rubric whose output it cannot read.
-#
-# `opentelemetry-api` is installed into every client venv by the engine, so
-# this needs no new requirement; it degrades to a no-op when the module is
-# absent (running this file outside the harness) or when no provider is
-# installed. The engine calls `setup_tracer()` AFTER importing this module, so
-# the tracer is fetched lazily — OTel's proxy tracer resolves to whatever
-# provider is installed by the time a span is started.
-#
-# Content is bounded deliberately. The row's full input is already stored in
-# `row.json`, and the harness truncates the root span's copy to 2000 chars, so
-# repeating a ~50k-token paper inside a span would multiply trace size for no
-# new information. Messages are recorded as role + length + a bounded excerpt,
-# which also survives the prompt being rewritten.
-try:
-    from opentelemetry import trace as _otel_trace
-except ImportError:  # pragma: no cover - only outside the harness venv
-    _otel_trace = None
+# Tracing lives in `_tracing.py` (the CodeEvolver skill's `traceable.py` plus
+# two local helpers). Nothing auto-instruments a raw `litellm.completion`, so
+# without these spans this pipeline produces exactly one span carrying its
+# final output -- the single word "accept"/"reject" `__call__` returns -- and
+# the review the model actually wrote (the THOUGHT, the per-dimension ratings,
+# the Overall score) is computed and thrown away unseen. The architect cannot
+# improve a rubric whose output it cannot read.
+from ._tracing import span, summarize_messages, traceable
 
-MSG_EXCERPT_CHARS = 1500
+# The full response is the point of the `llm` span; this only guards against a
+# runaway generation, not against ordinary long reviews.
 RESPONSE_MAX_CHARS = 20000
-
-
-@contextlib.contextmanager
-def _span(name: str, kind: str):
-    """Start a span named `name` with `ce.span_kind = kind`, or do nothing.
-
-    Yields a setter `(key, value)` that writes a `ce.*` attribute, so callers
-    need no OTel-vs-no-op branching. Never raises: a tracing failure must not
-    fail a row.
-    """
-    if _otel_trace is None:
-        yield lambda key, value: None
-        return
-    tracer = _otel_trace.get_tracer("paperreview.review_pipeline")
-    with tracer.start_as_current_span(name) as span:
-        span.set_attribute("ce.span_kind", kind)
-
-        def _set(key: str, value) -> None:
-            try:
-                span.set_attribute(key, value if isinstance(value, (str, int, float, bool)) else str(value))
-            except Exception:  # noqa: BLE001
-                pass
-
-        yield _set
-
-
-def _summarize_messages(messages) -> str:
-    """`[{role, chars, content}]` as JSON, each content bounded.
-
-    Generic over the message list on purpose: the review form and system
-    prompt are what evolves, and this keeps working whatever they become.
-    """
-    out = []
-    for m in messages or []:
-        content = str(m.get("content") or "")
-        excerpt = content[:MSG_EXCERPT_CHARS]
-        if len(content) > MSG_EXCERPT_CHARS:
-            excerpt += f"\n... [{len(content) - MSG_EXCERPT_CHARS} more chars elided; the row's full input is in row.json]"
-        out.append({"role": m.get("role"), "chars": len(content), "content": excerpt})
-    return json.dumps(out, indent=2)
 
 
 REVIEW_SCORE_FIELDS = (
@@ -186,94 +133,60 @@ class ReviewPipeline:
     """One LLM call per paper: full NeurIPS-form review, then extract Decision."""
 
     def __init__(self):
-        # Solver LM: DeepSeek-V4-Flash on GMI Cloud (reasoning=high set on the
-        # call below). Same wiring as the arc-agi experiment: the optimizer
-        # (GLM-5.2) and this solver both run on GMI, so we pass the GMI endpoint
-        # + key explicitly (the proven GMI-as-OpenAI pattern) rather than
-        # relying on OPENAI_* env, which the server points at GMI for the
-        # reflection LM.
-        self.model = "openai/deepseek-ai/DeepSeek-V4-Flash"
-        self.api_base = "https://api.gmi-serving.com/v1"
-        self.api_key = os.environ.get("GMI_CLOUD_API_KEY") or os.environ.get("GMI_API_KEY")
-
-    # --- Hang guard (mirrors the arc-agi seed solver) --------------------
-    # GMI can "hang" a request: zero bytes until its gateway kills the
-    # connection minutes later, which walls an entire parallel eval at the
-    # straggler. Streaming makes hangs detectable — GMI streams reasoning
-    # deltas continuously (measured inter-chunk gap ~3s), so READ_GAP_TIMEOUT_S
-    # of total silence is an unambiguous hang: abort fast and retry instead of
-    # waiting for the gateway. httpx applies `timeout` per READ on a stream, so
-    # long generations are unaffected; TOTAL_BUDGET_S caps the row across all
-    # attempts.
-    READ_GAP_TIMEOUT_S = 240
-    TOTAL_BUDGET_S = 2400
-    MAX_ATTEMPTS = 2
+        # The solver LM: the pinned model on whichever provider is currently
+        # serving it, with the next provider down the preference order covering
+        # for it per call. Building it here (rather than at call time) means a
+        # missing key or an unroutable provider fails before the eval starts.
+        self.lm = build_task_lm()
 
     def _complete(self, messages):
-        """Streaming completion with hang detection; returns content text.
+        """One routed completion; returns the response text.
 
         Emits one `llm` span per call recording the request, the FULL response
-        text and how the hang guard behaved (attempts, stream chunks, elapsed,
-        the error of every failed attempt). Retries are the failure mode this
-        program is most exposed to, and they were previously invisible.
+        text, which provider actually served it, and how the hang guard behaved
+        (attempts, stream chunks, elapsed, the error of every failed attempt).
+        Retries and provider diverts are the failure modes this program is most
+        exposed to, and they were previously invisible.
+
+        `src/lm_provider.py` also stamps `lm.fallback.*` / `lm.breaker.*` /
+        `lm.primary_skipped` on this same span when a call is diverted, so a
+        row served by the cover says so in the trace.
         """
-        start = time.monotonic()
-        last_err = None
-        attempts = 0
-        chunks = 0
-        with _span("review_llm", "llm") as set_attr:
-            set_attr("ce.inputs.messages", _summarize_messages(messages))
-            set_attr("ce.inputs.model", self.model)
-            set_attr("ce.inputs.api_base", self.api_base)
-            set_attr("ce.inputs.reasoning_effort", "high")
-            set_attr("gen_ai.request.model", self.model)
-            errors = []
-            for _attempt in range(self.MAX_ATTEMPTS):
-                if time.monotonic() - start > self.TOTAL_BUDGET_S - self.READ_GAP_TIMEOUT_S:
-                    errors.append("skipped attempt: too little of the total budget left")
-                    break
-                attempts += 1
-                try:
-                    stream = litellm.completion(
-                        model=self.model,
-                        api_base=self.api_base,
-                        api_key=self.api_key,
-                        messages=messages,
-                        reasoning_effort="high",
-                        allowed_openai_params=["reasoning_effort"],
-                        stream=True,
-                        # Per-read gap cap on a stream (NOT total duration): only
-                        # trips when the connection goes fully silent (real hang).
-                        timeout=self.READ_GAP_TIMEOUT_S,
-                    )
-                    parts = []
-                    for chunk in stream:
-                        if time.monotonic() - start > self.TOTAL_BUDGET_S:
-                            raise TimeoutError(
-                                f"row exceeded total budget {self.TOTAL_BUDGET_S}s"
-                            )
-                        if chunk.choices:
-                            chunks += 1
-                            delta = chunk.choices[0].delta
-                            if delta is not None and getattr(delta, "content", None):
-                                parts.append(delta.content)
-                    content = "".join(parts)
-                    set_attr("ce.output", content[:RESPONSE_MAX_CHARS])
-                    set_attr("response_chars", len(content))
-                    set_attr("attempts", attempts)
-                    set_attr("stream_chunks", chunks)
-                    set_attr("elapsed_s", round(time.monotonic() - start, 1))
-                    if errors:
-                        set_attr("recovered_after_errors", json.dumps(errors))
-                    return content
-                except Exception as exc:  # noqa: BLE001 — hang/gap/transient
-                    last_err = exc
-                    errors.append(f"{type(exc).__name__}: {exc}")
-            set_attr("attempts", attempts)
-            set_attr("stream_chunks", chunks)
-            set_attr("elapsed_s", round(time.monotonic() - start, 1))
-            set_attr("ce.error", json.dumps(errors) if errors else "completion failed")
-        raise last_err if last_err else RuntimeError("completion failed")
+        stats = CallStats()
+        failure = None
+        with span("review_llm", "llm") as set_attr:
+            set_attr("ce.inputs.messages", summarize_messages(messages))
+            set_attr("ce.inputs.model", self.lm.model)
+            if self.lm.api_base:
+                set_attr("ce.inputs.api_base", self.lm.api_base)
+            set_attr("ce.inputs.reasoning_effort", REASONING_EFFORT)
+            set_attr("gen_ai.request.model", self.lm.model)
+            try:
+                content = self.lm.complete(messages, stats=stats)
+            except Exception as exc:  # noqa: BLE001 -- recorded, then re-raised
+                failure = exc
+            else:
+                set_attr("ce.output", content[:RESPONSE_MAX_CHARS])
+                set_attr("response_chars", len(content))
+
+            set_attr("attempts", stats.attempts)
+            set_attr("stream_chunks", stats.stream_chunks)
+            set_attr("elapsed_s", stats.elapsed_s)
+            set_attr("lm.provider", stats.provider)
+            set_attr("lm.served_by", stats.served_by)
+
+            if failure is None:
+                if stats.errors:
+                    set_attr("recovered_after_errors", json.dumps(stats.errors))
+                return content
+            set_attr(
+                "ce.error",
+                json.dumps(stats.errors) if stats.errors else "completion failed",
+            )
+        # Outside the span: a failed call is this program's data, not a broken
+        # span, and marking the span ERROR would hide `ce.error` behind a
+        # recorded exception.
+        raise failure
 
     def __call__(self, paper_text: str = "", **kwargs) -> str:
         prompt = (
@@ -295,22 +208,31 @@ Here is the paper you are asked to review:
             print(f"[review] LLM call error: {e}", file=sys.stderr)
             return ""
 
-        # The parsed review is the only place the per-dimension ratings exist:
-        # this method returns just the decision word, so without a span the
-        # Soundness / Significance / Overall the rubric produced are discarded
-        # and the architect has no way to see WHY a paper was rejected.
-        with _span("extract_review", "function") as set_attr:
-            set_attr("ce.inputs.response_chars", len(content or ""))
-            review = _extract_last_json(content or "")
-            if not review or "Decision" not in review:
-                msg = "could not extract Decision from response"
-                set_attr("ce.error", msg)
-                set_attr("ce.output", (content or "")[:2000])
-                print(f"[review] {msg}", file=sys.stderr)
-                return ""
-            scores = {k: review.get(k) for k in REVIEW_SCORE_FIELDS if k in review}
-            set_attr("ce.output", json.dumps(scores))
-            # Also on stderr: `eval_stderr.log` keeps this even for an eval whose
-            # spans are never opened, and it is the aggregate view across rows.
-            print(f"[review] basis={json.dumps(scores)}", file=sys.stderr)
-        return str(review["Decision"]).strip().lower()
+        try:
+            scores = self._extract_review(content or "")
+        except ValueError as e:
+            print(f"[review] {e}", file=sys.stderr)
+            return ""
+        # Also on stderr: `eval_stderr.log` keeps this even for an eval whose
+        # spans are never opened, and it is the aggregate view across rows.
+        print(f"[review] basis={json.dumps(scores)}", file=sys.stderr)
+        return str(scores["Decision"]).strip().lower()
+
+    # `max_attr_chars` bounds the response echoed back as this span's input;
+    # the full text is already on the `llm` span above. The ratings it returns
+    # exist nowhere else -- `__call__` returns only the decision word -- so
+    # without this span the architect cannot see WHY a paper was rejected.
+    @traceable("function", name="extract_review", max_attr_chars=2000)
+    def _extract_review(self, content: str) -> dict:
+        """Per-dimension ratings from the response, or `ValueError` if unusable.
+
+        Raising keeps "the provider failed" distinguishable from "the rubric
+        produced garbage": the first leaves `ce.error` on `review_llm`, the
+        second leaves it here, on a span whose input is the unusable text.
+        Malformed decisions score 0 and stay in the denominator, so which one
+        happened matters.
+        """
+        review = _extract_last_json(content)
+        if not review or "Decision" not in review:
+            raise ValueError("could not extract Decision from response")
+        return {k: review.get(k) for k in REVIEW_SCORE_FIELDS if k in review}
